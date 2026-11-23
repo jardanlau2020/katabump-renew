@@ -2,8 +2,12 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
+import sys
 import time
 import subprocess
+from datetime import date, datetime
+
 import requests
 from seleniumbase import SB
 
@@ -345,17 +349,125 @@ def _read_alert(sb):
         return ""
 
 
-def _goto_server_detail(sb) -> bool:
-    """在 Dashboard 首页查找并点击 See 进入服务器详情页"""
+_EXPIRY_DATE_PATTERNS = (
+    r"[Ee]xpir\w*[^\d]{0,30}(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+    r"[Ee]xpir\w*[^\d]{0,30}(\d{1,2}[-/]\d{1,2}[-/]\d{4})",
+    r"到期[^\d]{0,12}(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})[^\d]{0,20}[Rr]enew",
+)
+_EXPIRY_DAYS_PATTERNS = (
+    r"[Rr]enew\w*[^\d]{0,20}(\d+)\s*(?:days?|天)",
+    r"(\d+)\s*(?:days?|天)[^\n]{0,20}(?:left|remaining|after|後|后)",
+    r"(?:剩餘|剩余|remaining)[^\d]{0,12}(\d+)\s*(?:days?|天)",
+)
+
+
+def _parse_dt(text):
+    """把抓到的日期串解析成 date；认不出来返回 None。"""
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y",
+                "%m/%d/%Y", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _read_expiry(sb):
+    """读服务器详情页的到期信息，返回 (kind, value)，kind ∈ {"date","days"}。
+
+    冷王 #89：续期结果只认「到期时间后移」，所以必须先有一个可比的读数。
+    读不到一律返回 (None, None)，上层按 UNKNOWN 处理 —— 绝不猜成功。
+    """
+    try:
+        text = sb.get_text("body") or ""
+    except Exception as e:
+        print(f"⚠️  读页面文本失败：{e}")
+        return None, None
+    text = " ".join(text.split())
+    for pat in _EXPIRY_DATE_PATTERNS:
+        m = re.search(pat, text)
+        if m:
+            d = _parse_dt(m.group(1))
+            if d:
+                return "date", d
+    for pat in _EXPIRY_DAYS_PATTERNS:
+        m = re.search(pat, text, re.I)
+        if m:
+            try:
+                return "days", int(m.group(1))
+            except (TypeError, ValueError):
+                continue
+    print("⚠️  页面上没识别出到期时间（日期和剩余天数都没有）")
+    return None, None
+
+
+def _expiry_moved(before, after) -> bool:
+    """只有「到期日」读数能证明续期生效。
+
+    冷王 #89 复审：`days` 抓的是「Renew(able) in N days」这种**倒计时**，
+    不是到期日。续期成功后倒计时会重置回同样的天数，`after > before` 不成立 ——
+    拿它当判据会天天误红。所以这里只有 kind == "date" 才有资格判成功。
+    """
+    if not before or not after:
+        return False
+    if before[0] != "date" or after[0] != "date":
+        return False
+    return after[1] > before[1]
+
+
+CRITICAL_DAYS = 1          # 剩 <= 1 天或已过期 = 临界，不能静默跳过
+
+
+def _is_critical(before) -> bool:
+    """到期读数是否已经到了不能静默跳过的地步（照 1cehost 的 is_critical 语义）。"""
+    if not before or before[0] != "date":
+        return False
+    return (before[1] - date.today()).days <= CRITICAL_DAYS
+
+
+def _judge_not_yet(before):
+    """页面说「还不能续期」时的结论。
+
+    冷王 #89 复审：这里原来直接 exit 0 —— 服务器已经过期将删、页面照样说
+    can't renew，于是永久绿灯。现在必须先读一次到期日再判。
+    """
+    if _is_critical(before):
+        left = (before[1] - date.today()).days
+        detail = ("已过期 %d 天" % -left) if left < 0 else ("剩 %d 天" % left)
+        print(f"❌ 页面说未到窗口，但到期日 {before[1]}（{detail}）已临界 → 判失败")
+        send_tg_message("❌", "续期失败（未到窗口但已临界）",
+                        f"到期 {before[1]}（{detail}）")
+        return "failed"
+    if before and before[0] == "date":
+        print(f"ℹ️  未到续期窗口，到期日 {before[1]}，尚有缓冲 → 跳过")
+        send_tg_message("ℹ️", "⚠️ 未到续期时间", f"到期 {before[1]}")
+        return "not_yet"
+    print("❌ 页面说未到窗口，但读不到到期日 → 无法确认是否临近过期")
+    send_tg_message("⚠️", "结果未知（未到窗口且读不到到期日）",
+                    "无法确认是否临近过期，请人工看一眼")
+    return "unknown"
+
+
+def _goto_server_detail(sb):
+    """进入服务器详情页。返回 (nav, not_yet_hint)。
+
+    nav ∈ {"ok","failed"}；not_yet_hint 表示首页是否已出现「还不能续期」提示。
+
+    冷王 #89 复审：原来一看到 can't renew 就直接 return —— **根本没进详情页、
+    没读到期日**，于是「一直 can't renew」= 永久绿灯，哪怕服务器已经过期将删。
+    现在照常进详情页，把这条提示当信号带下去，读了到期日再由 _judge_not_yet 判。
+    """
     print("\n🖥️  正在进入服务器续期页...")
     time.sleep(5)
 
-    # 检查页面顶部是否已有"还无法续期"全局提示
+    not_yet_hint = False
     alert_text = _read_alert(sb)
     if alert_text and "can't renew" in alert_text.lower():
-        print(f"ℹ️  页面顶部提示: {alert_text}")
-        send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text)
-        return False
+        print(f"ℹ️  首页提示还不能续期: {alert_text}")
+        not_yet_hint = True
 
     # 多种选择器尝试查找 See 链接
     selectors = [
@@ -404,13 +516,14 @@ def _goto_server_detail(sb) -> bool:
         except Exception:
             pass
         sb.save_screenshot("servers_page_fail.png")
-        return False
+        # 冷王 #89：找不到服务器入口不是「没到窗口」，是页面/登录坏了，必须非绿。
+        return "failed", not_yet_hint
 
     print("🖱️  点击 'See' 进入服务器详情页...")
     see_link.click()
     time.sleep(5)
     print(f"📄 当前页面: {sb.get_current_url()}")
-    return True
+    return "ok", not_yet_hint
 
 
 def _open_renew_modal(sb) -> bool:
@@ -564,46 +677,101 @@ def _submit_renew(sb):
     time.sleep(8)
 
 
-def _check_renew_result(sb):
-    """读取页面 alert 提示，判断续期结果并推送 TG 通知"""
-    print("\n📋 检查续期结果...")
+def _confirm_renew(sb, before):
+    """点完 Renew 之后确认结果，返回 "ok" / "failed" / "unknown"。
+
+    冷王 #89：页面 alert 文案只做日志，判定只认「到期时间后移」。
+    原来只要文案里出现 renewed / success / extended 就发 ✅ —— 那正是假绿来源。
+    读不到续期前读数就是未知，读不到续期后读数也是未知，两者都不许当成功。
+    """
+    print("\n📋 确认续期结果（以到期时间为准）...")
     alert_text = _read_alert(sb)
     if not alert_text:
         time.sleep(3)
         alert_text = _read_alert(sb)
-
     if alert_text:
-        print(f"📩 页面提示: {alert_text}")
-        low = alert_text.lower()
-        if "can't renew" in low or "unable" in low:
-            send_tg_message("⏳", "未到续期时间", alert_text)
-        elif any(kw in low for kw in ( "renewed", "success", "extended")):
-            send_tg_message("✅", "续期成功", alert_text)
-        else:
-            send_tg_message("ℹ️", "续期操作已执行", alert_text)
+        # 只记录，不参与判定
+        print(f"📩 页面提示（仅日志，不作判据）: {alert_text}")
     else:
-        print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
-        send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示")
+        print("ℹ️  没有 alert 提示，继续用到期时间复核")
+
+    if not before or before[0] != "date":
+        # 冷王 #89 复审：days 是「Renew in N days」倒计时，续期后本来就会重置，
+        # 不能当到期日判据；读不到就更没有基准。两种都只能算未知。
+        print("❌ 续期前没有可用的到期日读数（读不到，或只有倒计时）→ 结果未知")
+        send_tg_message("⚠️", "结果未知（续期前读不到到期日）",
+                        "倒计时不能当到期日用，请人工确认")
+        return "unknown"
+
+    after = (None, None)
+    moved = False
+    for i in range(1, 4):
+        time.sleep(10)
+        try:
+            sb.refresh()
+            time.sleep(3)
+        except Exception as e:
+            print(f"⚠️  刷新页面失败：{e}，重试进入详情页")
+            try:
+                _goto_server_detail(sb)
+            except Exception:
+                pass
+        after = _read_expiry(sb)
+        print(f"🔁 第 {i} 轮复核：续期前 {before[1]} → 现在 {after[1]}")
+        if _expiry_moved(before, after):
+            moved = True
+            break
+
+    if moved:
+        print(f"✅ 到期时间已后移：{before[1]} → {after[1]}")
+        send_tg_message("✅", "续期成功", f"{before[1]} → {after[1]}")
+        return "ok"
+
+    if not after or after[0] != "date":
+        print("❌ 续期后读不到到期日（或只读到倒计时）→ 无法确认")
+        send_tg_message("⚠️", "结果未知（续期后读不到到期日）",
+                        f"续期前 {before[1]}，续期后没读到")
+        return "unknown"
+
+    print(f"❌ 到期日没有后移：{before[1]} → {after[1]}")
+    send_tg_message("❌", "续期失败（到期日未变）", f"{before[1]} → {after[1]}")
+    return "failed"
 
 
 def renew_server(sb):
-    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交"""
+    """登录成功后调用：详情页 -> 抓到期读数 -> Renew -> 提交 -> 复核。
+
+    返回 "ok" / "not_yet" / "failed" / "unknown"，由 main 映射成退出码。
+    原来这个函数没有返回值，main 也不 sys.exit —— 于是不管续没续上 run 都是绿的。
+    """
     print("\n" + "#" * 25)
     print("  开始自动续期流程")
     print("#" * 25)
 
-    if not _goto_server_detail(sb):
-        return
+    nav, not_yet_hint = _goto_server_detail(sb)
+    if nav != "ok":
+        return nav
+
+    before = _read_expiry(sb)
+    print(f"📅 续期前到期读数: {before[0]}={before[1]}")
+
+    # 冷王 #89 复审：未到窗口不再直接绿灯，先看到期日是否已临界
+    alert_now = _read_alert(sb) or ""
+    if not_yet_hint or "can't renew" in alert_now.lower():
+        return _judge_not_yet(before)
 
     if not _open_renew_modal(sb):
-        return
+        # 打不开续期弹窗：没进过续期尝试，不能算成功
+        print("❌ 打不开续期弹窗，本轮未执行续期")
+        send_tg_message("❌", "续期失败（打不开续期弹窗）", "需人工检查")
+        return "failed"
 
     # altcha_ok = _solve_altcha(sb)
     # if not altcha_ok:
     #     print("⚠️ ALTCHA 验证未通过，仍尝试提交 Renew...")
 
     _submit_renew(sb)
-    _check_renew_result(sb)
+    return _confirm_renew(sb, before)
 
 
 #  脚本执行入口 (可选代理)
@@ -623,6 +791,8 @@ def main():
         print("🌐 未使用代理，直连访问")
     
     print("🚀 启动浏览器...")
+    # 浏览器起不来 / SB 抛异常时也要有明确结论，不留 UnboundLocalError
+    outcome = "failed"
     with SB(**sb_kwargs) as sb:
         # print("✅ 浏览器已启动")
         try:
@@ -632,10 +802,19 @@ def main():
             pass
 
         if login(sb):
-            renew_server(sb)   # 登录成功后自动续期
+            outcome = renew_server(sb)   # 登录成功后自动续期
         else:
             print("\n❌ 登录失败，终止后续续期操作。")
             send_tg_message("❌", "登录失败", "未知")
+            outcome = "failed"
+
+    # 冷王 #89：只有「真续上」和「明确未到窗口」可以绿灯；
+    # 读不到天数 / 鉴权失败 / 页面进不去 一律非 0。
+    if outcome in ("ok", "not_yet"):
+        print(f"\n🏁 结束：{outcome}")
+        sys.exit(0)
+    print(f"\n❌ 结束：{outcome}（exit 1）")
+    sys.exit(1)
 
 if __name__ == "__main__":
     main()
